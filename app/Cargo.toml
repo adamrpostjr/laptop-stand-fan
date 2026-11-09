@@ -1,0 +1,21 @@
+[package]
+name = "fanstand-app"
+description = "Desktop app (tray + window) for the BLE cooling laptop stand; talks to the fanstand service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fanstand-app"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+fanstand-ipc.workspace = true
+eframe = "0.37"
+tray-icon = "0.26"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

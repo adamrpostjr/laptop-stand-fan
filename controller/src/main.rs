@@ -1,7 +1,12 @@
 //! `fanstand`: desktop controller for the BLE cooling laptop stand.
 
 mod key;
+mod logging;
+#[cfg(windows)]
+mod pipe;
 mod run;
+#[cfg(windows)]
+mod service;
 mod stand;
 mod temp;
 
@@ -90,6 +95,16 @@ enum Cmd {
         /// Use the CPU-load estimate even if a sensor exists (testing)
         #[arg(long)]
         estimate: bool,
+        /// Also serve the FanStand app over the local pipe (like the service does)
+        #[cfg(windows)]
+        #[arg(long)]
+        serve: bool,
+    },
+    /// Install / control the Windows service (install, uninstall, start, stop, status)
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
     },
     /// Show which CPU temperature source is used and a few readings (no stand needed)
     Temp {
@@ -98,18 +113,68 @@ enum Cmd {
     },
 }
 
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Copy fanstand to Program Files, install the key machine-wide and start the service (elevated)
+    Install {
+        /// Key file to install (default: this user's key)
+        #[arg(long)]
+        key: Option<std::path::PathBuf>,
+    },
+    /// Stop and remove the service (elevated)
+    Uninstall {
+        /// Also delete the machine key, logs and the installed binaries
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Install or replace the machine-wide key the service uses (elevated)
+    SetKey { file: std::path::PathBuf },
+    /// Start the service (elevated)
+    Start,
+    /// Stop the service; the stand falls back to its safe speed (elevated)
+    Stop,
+    /// Service state plus what it currently sees
+    Status,
+    /// Started by Windows; not for interactive use
+    #[command(hide = true)]
+    Run,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum ModeArg {
     Auto,
     Manual,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("fanstand=info"))
-        .format_target(false)
-        .init();
+    // The service dispatcher takes over this thread and sets up its own
+    // logging and runtime, so it must not run inside ours.
+    #[cfg(windows)]
+    if let Cmd::Service { cmd } = &cli.cmd {
+        return match cmd {
+            ServiceCmd::Run => service::dispatch(),
+            ServiceCmd::Install { key } => service::install(key.as_deref()),
+            ServiceCmd::Uninstall { purge } => service::uninstall(*purge),
+            ServiceCmd::SetKey { file } => {
+                let hex = key::read_key_file(file)?;
+                let path = key::install_machine_key(&hex).map_err(|e| {
+                    e.context("run this from an elevated terminal (e.g. `sudo fanstand service set-key ...`)")
+                })?;
+                println!("key installed at {} (the service picks it up on its next connect)", path.display());
+                Ok(())
+            }
+            ServiceCmd::Start => service::start(),
+            ServiceCmd::Stop => service::stop(),
+            ServiceCmd::Status => service::status(),
+        };
+    }
+    logging::init_console();
+    tokio::runtime::Runtime::new()?.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     let timeout = Duration::from_secs(cli.timeout);
     let dev = cli.device.as_deref();
 
@@ -123,19 +188,42 @@ async fn main() -> Result<()> {
                 "Copy that file to your other computers' config dir to let them control the stand."
             );
         }
-        Cmd::Run { interval, estimate } => {
-            let k = key::load()?;
+        Cmd::Run {
+            interval,
+            estimate,
+            #[cfg(windows)]
+            serve,
+        } => {
+            key::load()?; // fail fast; the loop reloads it on every connect
+            let shared = run::new_shared();
+            let (senders, inputs) = run::inputs();
+            #[cfg(windows)]
+            if serve {
+                let (sh, tx) = (shared.clone(), senders.requests.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = pipe::serve(sh, tx).await {
+                        log::error!("app pipe: {e:#}");
+                    }
+                });
+            }
             run::run(
-                k,
                 run::Options {
                     device: cli.device.clone(),
                     scan_timeout: timeout,
                     interval: Duration::from_secs(interval.max(1)),
                     force_estimate: estimate,
                 },
+                shared,
+                inputs,
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
             )
             .await?;
+            drop(senders);
         }
+        #[cfg(windows)]
+        Cmd::Service { .. } => unreachable!("handled in main"),
         Cmd::Temp { estimate } => {
             let mut src = temp::detect(estimate);
             println!("source: {}", src.describe());

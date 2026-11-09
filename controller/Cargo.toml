@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 fanstand-protocol.workspace = true
+fanstand-ipc.workspace = true
 anyhow = "1"
 btleplug = "0.13"
 clap = { version = "4.6", features = ["derive"] }
@@ -20,8 +21,15 @@ futures = "0.3"
 getrandom = "0.4"
 log = "0.4"
 sysinfo = { version = "0.40", default-features = false, features = ["system", "component"] }
-tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "io-util", "net"] }
 uuid = "1.26"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_System_Performance"] }
+windows = { version = "0.62", features = [
+    "Win32_System_Performance",
+    "Win32_System_EventLog",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+windows-service = "0.8"

@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FanStand MSI (WiX v5). Build with installer\build.ps1.
+
+  Installs:
+  - %ProgramFiles%\FanStand\fanstand.exe      CLI + the service (on PATH)
+  - %ProgramFiles%\FanStand\fanstand-app.exe  tray app (Start menu, starts at logon)
+  - the "FanStand" service: LocalSystem, auto-start, restarts on failure
+  - the Event Log source Application/FanStand
+  - %ProgramData%\fanstand\private\  (SYSTEM + Administrators only) for the key
+
+  The key is never inside the MSI. Pass it at install time:
+      msiexec /i FanStand-x.y.z-x64.msi KEYFILE="F:\fanstand-key"
+  or later, elevated:  fanstand service set-key F:\fanstand-key
+  Uninstall keeps the key and logs in %ProgramData%\fanstand.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="FanStand"
+           Manufacturer="Adam Post"
+           Version="$(var.Version)"
+           UpgradeCode="8FC6F2AF-0AEA-49EB-B5F1-EA6222B0BF2D"
+           Scope="perMachine"
+           InstallerVersion="500">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer FanStand is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="FanStandIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="FanStandIcon" />
+    <Property Id="ARPCOMMENTS" Value="Bluetooth cooling laptop stand: service, CLI and tray app" />
+
+    <!-- Path to a key file; optional, see the header comment. -->
+    <Property Id="KEYFILE" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="FanStand" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="fanstand">
+        <Directory Id="PRIVATEFOLDER" Name="private" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="FanStand" Level="1">
+
+      <!-- CLI + service -->
+      <Component Id="Service" Directory="INSTALLFOLDER">
+        <File Id="FanstandExe" Source="$(var.BinDir)\fanstand.exe" KeyPath="yes" />
+        <ServiceInstall Id="FanStandService"
+                        Name="FanStand"
+                        DisplayName="FanStand cooling stand"
+                        Description="Sends the CPU temperature to the Bluetooth cooling laptop stand so its fans follow the fan curve. Serves the FanStand app."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="service run"
+                        Vital="yes">
+          <ServiceDependency Id="bthserv" />
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart"
+                              RestartServiceDelayInSeconds="10"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <ServiceControl Id="FanStandServiceControl" Name="FanStand"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]"
+                     Part="last" Action="set" System="yes" Permanent="no" />
+      </Component>
+
+      <!-- Event Log source: message N is "%1" in this .NET-provided DLL. -->
+      <Component Id="EventSource" Directory="INSTALLFOLDER">
+        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\FanStand">
+          <RegistryValue Name="EventMessageFile" Type="expandable"
+                         Value="%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\EventLogMessages.dll"
+                         KeyPath="yes" />
+          <RegistryValue Name="TypesSupported" Type="integer" Value="7" />
+        </RegistryKey>
+      </Component>
+
+      <!-- Tray app: Start menu entry + start at logon (all users). -->
+      <Component Id="App" Directory="INSTALLFOLDER">
+        <File Id="AppExe" Source="$(var.BinDir)\fanstand-app.exe" KeyPath="yes">
+          <Shortcut Id="AppShortcut" Directory="ProgramMenuFolder" Name="FanStand"
+                    Description="Fan speeds and manual override for the cooling stand"
+                    Icon="FanStandIcon" WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="FanStand" Type="string"
+                       Value="&quot;[INSTALLFOLDER]fanstand-app.exe&quot; --minimized" />
+      </Component>
+
+      <!-- Key folder: protected DACL, SYSTEM + Administrators only. -->
+      <Component Id="PrivateFolder" Directory="PRIVATEFOLDER" Guid="6B0C2C9E-3D1A-4A57-9C55-1E7B2D0F4A11">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+        </CreateFolder>
+      </Component>
+
+      <!-- Copy the key in, only when KEYFILE was given. -->
+      <Component Id="KeyFromProperty" Directory="PRIVATEFOLDER" Condition="KEYFILE"
+                 Guid="0E5B6F4A-8C2D-4E19-A7B3-5D9C1F2E8A60">
+        <CopyFile Id="CopyKey" SourceProperty="KEYFILE"
+                  DestinationDirectory="PRIVATEFOLDER" DestinationName="key" />
+        <CreateFolder />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>

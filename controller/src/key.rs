@@ -5,6 +5,10 @@
 //! - macOS:   `~/Library/Application Support/fanstand/key`
 //! - Windows: `%APPDATA%\fanstand\key`
 //!
+//! then, on Windows, the machine-wide key the service uses:
+//! `%ProgramData%\fanstand\private\key`, readable only by SYSTEM and
+//! Administrators (`fanstand service install` or the MSI puts it there).
+//!
 //! The same key is compiled into the firmware (`FANSTAND_KEY` at build time).
 
 use std::path::PathBuf;
@@ -19,18 +23,79 @@ pub fn key_path() -> Result<PathBuf> {
         .join("key"))
 }
 
+/// `%ProgramData%\fanstand` (Windows only).
+#[cfg(windows)]
+pub fn program_data() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
+        .join("fanstand")
+}
+
+#[cfg(windows)]
+pub fn machine_key_path() -> PathBuf {
+    program_data().join("private").join("key")
+}
+
 pub fn load() -> Result<Key> {
     if let Ok(hex) = std::env::var("FANSTAND_KEY") {
         return parse_key_hex(hex.trim()).context("FANSTAND_KEY is not 64 hex digits");
     }
-    let path = key_path()?;
-    let hex = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "no key at {} (copy the key from the machine you flashed from, or run `fanstand keygen` and reflash)",
-            path.display()
-        )
-    })?;
-    parse_key_hex(hex.trim()).with_context(|| format!("{} is not 64 hex digits", path.display()))
+    let mut paths = vec![];
+    // LocalSystem has a config dir too (systemprofile); harmless to look.
+    if let Ok(p) = key_path() {
+        paths.push(p);
+    }
+    #[cfg(windows)]
+    paths.push(machine_key_path());
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(hex) => {
+                return parse_key_hex(hex.trim())
+                    .with_context(|| format!("{} is not 64 hex digits", path.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    let tried: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
+    bail!(
+        "no key found (looked in {}). Copy the key from the machine you flashed from, or run `fanstand keygen` and reflash",
+        tried.join(", ")
+    )
+}
+
+/// Read and validate a key file, returning the normalised hex.
+pub fn read_key_file(path: &std::path::Path) -> Result<String> {
+    let hex = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let k = parse_key_hex(hex.trim())
+        .with_context(|| format!("{} is not 64 hex digits", path.display()))?;
+    Ok(KeyHex(&k).to_string())
+}
+
+/// Write the machine-wide key and lock it down to SYSTEM + Administrators.
+/// Needs an elevated process.
+#[cfg(windows)]
+pub fn install_machine_key(hex: &str) -> Result<PathBuf> {
+    let path = machine_key_path();
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Lock the folder before the key lands in it: protected DACL (no
+    // inheritance from ProgramData, which lets Users read), full control
+    // for SYSTEM and Administrators only. Well-known SIDs, so this works
+    // on non-English Windows too.
+    let status = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("running icacls")?;
+    if !status.success() {
+        bail!("icacls could not restrict {} ({status})", dir.display());
+    }
+    std::fs::write(&path, format!("{hex}\n"))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 pub fn generate(force: bool) -> Result<(PathBuf, String)> {
