@@ -181,6 +181,14 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
     let rw = NimbleProperties::READ | NimbleProperties::WRITE;
     let notify = NimbleProperties::READ | NimbleProperties::NOTIFY;
 
+    // !!! Characteristic ORDER is part of the protocol. It fixes the ATT
+    // handles, and clients (BlueZ, Windows, macOS) cache the GATT table per
+    // device. We don't bond, so they never get "service changed", and a
+    // reordered table makes old clients read the wrong characteristics.
+    // NEVER reorder or remove; only append new characteristics at the end:
+    // MODE, MANUAL_SPEED, TEMPERATURE, FAN_CURVE, CONFIG, COMMAND, FAN_RPM,
+    // STATUS, CAL_RESULT, FIRMWARE_VERSION, AUTH_CHALLENGE, AUTH_RESPONSE,
+    // DEBUG, CAL_TABLE.
     // ---- settings (read: snapshot, write: guarded)
     let c = readable(&mut svc, uuids::MODE, rw, &shared, |s| {
         s.settings.mode.encode().into()
@@ -192,6 +200,14 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
     });
     writable(&c, &w, "manual speed", |b| {
         decode_percent(b).map(Request::SetManual)
+    });
+
+    let c = svc.create_characteristic(
+        ble_uuid(uuids::TEMPERATURE),
+        NimbleProperties::WRITE | NimbleProperties::WRITE_NO_RSP,
+    );
+    writable(&c, &w, "temperature", |b| {
+        decode_temperature(b).map(Request::Temperature)
     });
 
     let c = readable(&mut svc, uuids::FAN_CURVE, rw, &shared, |s| {
@@ -209,15 +225,7 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
         Config::decode(b).map(Request::SetConfig)
     });
 
-    // ---- write-only
-    let c = svc.create_characteristic(
-        ble_uuid(uuids::TEMPERATURE),
-        NimbleProperties::WRITE | NimbleProperties::WRITE_NO_RSP,
-    );
-    writable(&c, &w, "temperature", |b| {
-        decode_temperature(b).map(Request::Temperature)
-    });
-
+    // ---- command (write-only)
     let c = svc.create_characteristic(ble_uuid(uuids::COMMAND), NimbleProperties::WRITE);
     writable(&c, &w, "command", |b| {
         Command::decode(b).map(Request::Command)
@@ -238,12 +246,6 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
     svc.create_characteristic(ble_uuid(uuids::FIRMWARE_VERSION), r)
         .lock()
         .set_value(version.as_bytes());
-    readable(&mut svc, uuids::DEBUG, r, &shared, |s| {
-        s.debug.encode().into()
-    });
-    readable(&mut svc, uuids::CAL_TABLE, r, &shared, |s| {
-        encode_cal_table(&s.cal_table).into()
-    });
 
     // ---- AUTH_CHALLENGE / AUTH_RESPONSE
     {
@@ -284,6 +286,14 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
                 }
             });
     }
+
+    // ---- diagnostics (appended last; see the order rule above)
+    readable(&mut svc, uuids::DEBUG, r, &shared, |s| {
+        s.debug.encode().into()
+    });
+    readable(&mut svc, uuids::CAL_TABLE, r, &shared, |s| {
+        encode_cal_table(&s.cal_table).into()
+    });
     drop(svc);
 
     // ---- advertising: flags + 128-bit service UUID + name = 31 bytes
