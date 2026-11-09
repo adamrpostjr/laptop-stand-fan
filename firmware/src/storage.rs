@@ -22,6 +22,8 @@ impl Storage {
 
     /// Stored settings, or the defaults if there are none or they're invalid.
     pub fn load(&self) -> Settings {
+        // Slack so a longer blob (e.g. a future format) reads OK and is then
+        // rejected cleanly by `from_blob` instead of failing inside NVS.
         let mut buf = [0u8; BLOB_LEN + 8];
         match self.nvs.get_blob(KEY, &mut buf) {
             Ok(Some(b)) => match Settings::from_blob(b) {

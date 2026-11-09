@@ -9,6 +9,7 @@
 //!   less airflow
 
 use crate::codec::DecodeError;
+use crate::pct_to_permille;
 
 pub const MAX_POINTS: usize = 8;
 pub const MAX_ENCODED_LEN: usize = MAX_POINTS * 2;
@@ -102,7 +103,7 @@ impl FanCurve {
         let t = temp_dc as i32;
         let first = pts[0];
         if t <= first.temp_c as i32 * 10 {
-            return first.duty_pct as u16 * 10;
+            return pct_to_permille(first.duty_pct);
         }
         for w in pts.windows(2) {
             let (a, b) = (w[0], w[1]);
@@ -115,7 +116,45 @@ impl FanCurve {
                 return (da + (num + span / 2) / span) as u16;
             }
         }
-        pts[pts.len() - 1].duty_pct as u16 * 10
+        pct_to_permille(pts[pts.len() - 1].duty_pct)
+    }
+}
+
+impl core::str::FromStr for CurvePoint {
+    type Err = DecodeError;
+
+    /// `"40:20"`: °C, colon, duty %.
+    fn from_str(s: &str) -> Result<Self, DecodeError> {
+        let (t, d) = s.trim().split_once(':').ok_or(DecodeError::Syntax)?;
+        let num = |x: &str| x.trim().parse::<u8>().map_err(|_| DecodeError::Syntax);
+        Ok(Self::new(num(t)?, num(d)?))
+    }
+}
+
+impl FanCurve {
+    /// Parse `TEMP:DUTY` tokens, e.g. `"40:20 55:40".split_whitespace()`.
+    /// Used by both the firmware console and the desktop CLI.
+    pub fn parse<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Result<Self, DecodeError> {
+        let mut pts = [CurvePoint::default(); MAX_POINTS];
+        let mut n = 0;
+        for tok in tokens {
+            *pts.get_mut(n).ok_or(DecodeError::WrongLength)? = tok.parse()?;
+            n += 1;
+        }
+        Self::new(&pts[..n])
+    }
+}
+
+/// `40:20 55:40 ...`, the same form [`FanCurve::parse`] accepts.
+impl core::fmt::Display for FanCurve {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, p) in self.points().iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{}:{}", p.temp_c, p.duty_pct)?;
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +247,27 @@ mod tests {
             assert!(d <= 1000);
             prev = d;
         }
+    }
+
+    #[test]
+    fn parse_and_display() {
+        let c = FanCurve::parse("40:20  55:40 70:70".split_whitespace()).unwrap();
+        assert_eq!(std::format!("{c}"), "40:20 55:40 70:70");
+        assert_eq!(
+            FanCurve::parse(std::format!("{c}").split_whitespace()),
+            Ok(c)
+        );
+        assert_eq!(FanCurve::parse(["40-20"]), Err(DecodeError::Syntax));
+        assert_eq!(FanCurve::parse(["x:20"]), Err(DecodeError::Syntax));
+        assert_eq!(
+            FanCurve::parse(["50:50", "40:60"]),
+            Err(DecodeError::NotSorted)
+        );
+        assert_eq!(
+            FanCurve::parse([] as [&str; 0]),
+            Err(DecodeError::WrongLength)
+        );
+        assert_eq!(FanCurve::parse(["1:1"; 9]), Err(DecodeError::WrongLength));
     }
 
     #[test]

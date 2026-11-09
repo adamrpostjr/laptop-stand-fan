@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use fanstand_protocol::calibration::{STEPS, duty_at_step};
-use fanstand_protocol::codec::decode_rpm;
-use fanstand_protocol::curve::CurvePoint;
+use fanstand_protocol::calibration::{CalTable, STEP_MS, STEP_PCT, TOTAL_MS};
+use fanstand_protocol::codec::{ConfigPatch, ConfigRanges, decode_rpm};
+use fanstand_protocol::curve::MAX_POINTS;
 use fanstand_protocol::diag::{DebugInfo, reset_reason_name};
-use fanstand_protocol::{CalResult, Command, Config, FanCurve, Mode, Status, uuids};
+use fanstand_protocol::{CalResult, Command, DeciCelsius, FanCurve, Mode, Permille, Status, uuids};
 use futures::StreamExt;
 use uuid::Uuid;
 
@@ -58,22 +58,23 @@ enum Cmd {
     },
     /// Fan curve as TEMP:DUTY points, e.g. `40:20 55:40 70:70 85:100`
     SetCurve {
-        #[arg(required = true, num_args = 1..=8)]
+        #[arg(required = true, num_args = 1..=MAX_POINTS)]
         points: Vec<String>,
     },
-    /// Safety settings (only the given ones change)
+    /// Safety settings; only the given ones change
+    #[command(after_help = ConfigRanges.to_string())]
     SetConfig {
-        /// Failsafe speed % (30-100)
+        /// Failsafe speed %
         #[arg(long)]
         safe: Option<u8>,
-        /// Minimum duty % (0-60)
+        /// Minimum duty %
         #[arg(long)]
         min: Option<u8>,
-        /// Failsafe timeout s (5-600)
+        /// Failsafe timeout in seconds
         #[arg(long)]
         timeout_s: Option<u16>,
     },
-    /// Run minimum-duty calibration (~110 s) and show the result
+    /// Run minimum-duty calibration (about two minutes) and show the result
     Calibrate {
         /// Abort a running calibration instead
         #[arg(long)]
@@ -141,11 +142,7 @@ async fn main() -> Result<()> {
             for _ in 0..3 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 match src.read() {
-                    Ok(r) => println!(
-                        "  {:.1} °C{}",
-                        r.celsius,
-                        if r.estimated { "  (ESTIMATED)" } else { "" }
-                    ),
+                    Ok(r) => println!("  {r}"),
                     Err(e) => println!("  read failed: {e:#}"),
                 }
             }
@@ -200,30 +197,28 @@ async fn write_cmd(s: &Stand, cmd: Cmd) -> Result<()> {
             println!("manual {percent}%");
         }
         Cmd::SetCurve { points } => {
-            let curve = parse_curve(&points)?;
+            let curve = FanCurve::parse(points.iter().map(String::as_str))
+                .map_err(|e| anyhow::anyhow!("invalid curve: {e}"))?;
             s.set_curve(&curve).await?;
-            println!("curve set: {}", fmt_curve(&curve));
+            println!("curve set: {curve}");
         }
         Cmd::SetConfig {
             safe,
             min,
             timeout_s,
         } => {
-            let mut c = s.config().await?;
-            if let Some(v) = safe {
-                c.safe_speed_pct = v;
-            }
-            if let Some(v) = min {
-                c.min_duty_pct = v;
-            }
-            if let Some(v) = timeout_s {
-                c.failsafe_timeout_s = v;
-            }
-            let c = c
-                .validate()
-                .context("safe 30-100, min 0-60, timeout 5-600")?;
+            let patch = ConfigPatch {
+                safe_speed_pct: safe,
+                min_duty_pct: min,
+                failsafe_timeout_s: timeout_s,
+            };
+            let c = s
+                .config()
+                .await?
+                .apply(patch)
+                .with_context(|| format!("valid: {ConfigRanges}"))?;
             s.set_config(&c).await?;
-            println!("{}", fmt_config(&c));
+            println!("{c}");
         }
         Cmd::Calibrate { abort } => {
             if abort {
@@ -234,8 +229,7 @@ async fn write_cmd(s: &Stand, cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::SendTemp { celsius } => {
-            let dc = (celsius * 10.0).round() as i16;
-            s.send_temperature(dc).await?;
+            s.send_temperature(temp::to_deci_celsius(celsius)).await?;
             // write-without-response gives no feedback; read back via DEBUG
             tokio::time::sleep(Duration::from_millis(400)).await;
             let d = s.debug().await?;
@@ -266,9 +260,9 @@ async fn print_status(s: &Stand) -> Result<()> {
         rpm[0], rpm[1], d.raw_rpm[0], d.raw_rpm[1]
     );
     println!(
-        "duty       {:.1}%  (target {:.1}%){}",
-        d.duty_permille as f32 / 10.0,
-        d.target_permille as f32 / 10.0,
+        "duty       {}  (target {}){}",
+        Permille(d.duty_permille),
+        Permille(d.target_permille),
         if d.flags & DebugInfo::FLAG_GRACE != 0 {
             "  [stall grace]"
         } else {
@@ -279,15 +273,15 @@ async fn print_status(s: &Stand) -> Result<()> {
         Mode::Auto => println!("mode       auto"),
         Mode::Manual => println!("mode       manual {manual}%"),
     }
-    println!("flags      {}", fmt_status(st));
+    println!("flags      {st}");
     println!("temp       {}", fmt_temp(&d));
     println!(
         "tach line  fan1 {}  fan2 {}",
         fmt_probe(d.tach_high_samples[0], rpm[0]),
         fmt_probe(d.tach_high_samples[1], rpm[1])
     );
-    println!("curve      {}", fmt_curve(&curve));
-    println!("config     {}", fmt_config(&cfg));
+    println!("curve      {curve}");
+    println!("config     {cfg}");
     println!("calibrate  {}", fmt_cal(cal));
     println!(
         "uptime     {}  (last reset: {})  free heap {} KB{}",
@@ -313,19 +307,21 @@ async fn watch(s: &Stand) -> Result<()> {
     );
     println!("watching {} (Ctrl+C to stop)", s.name);
     let mut status = s.status().await?;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut ctrl_c => break,
             v = n.next() => {
                 let Some(v) = v else { bail!("disconnected") };
                 if v.uuid == st_u {
-                    status = Status(v.value.first().copied().unwrap_or(0));
-                    println!("status → {}", fmt_status(status));
+                    status = Status::decode(&v.value)?;
+                    println!("status → {status}");
                 } else if v.uuid == rpm_u {
                     let r = decode_rpm(&v.value)?;
                     let d = s.debug().await?;
-                    println!("rpm {:>4} / {:>4}  duty {:5.1}%  temp {}  [{}]",
-                        r[0], r[1], d.duty_permille as f32 / 10.0, fmt_temp(&d), fmt_status(status));
+                    println!("rpm {:>4} / {:>4}  duty {:>6}  temp {}  [{status}]",
+                        r[0], r[1], Permille(d.duty_permille).to_string(), fmt_temp(&d));
                 }
             }
         }
@@ -337,12 +333,18 @@ async fn calibrate(s: &Stand) -> Result<()> {
     s.subscribe(uuids::CAL_RESULT).await?;
     let mut n = s.notifications().await?;
     s.command(Command::StartCalibration).await?;
-    println!("calibrating: fans go to 100%, then step down 5% every 5 s (~110 s). Ctrl+C aborts.");
+    println!(
+        "calibrating: fans go to 100%, then {STEP_PCT}% lower every {} s (~{} s). Ctrl+C aborts.",
+        STEP_MS / 1000,
+        TOTAL_MS / 1000
+    );
     let cal_u = Uuid::from_u128(uuids::CAL_RESULT);
     let mut last_progress = None;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     let result = loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut ctrl_c => {
                 s.command(Command::AbortCalibration).await?;
                 bail!("aborted");
             }
@@ -366,11 +368,7 @@ async fn calibrate(s: &Stand) -> Result<()> {
             }
         }
     };
-    let table = s.cal_table().await?;
-    println!(" duty | fan1 rpm | fan2 rpm");
-    for (i, row) in table.iter().enumerate().take(STEPS) {
-        println!("{:4}% | {:8} | {:8}", duty_at_step(i), row[0], row[1]);
-    }
+    print!("{}", CalTable(&s.cal_table().await?));
     println!("result: {}", fmt_cal(result));
     if let CalResult::Failed(_) = result {
         bail!("calibration failed");
@@ -380,41 +378,9 @@ async fn calibrate(s: &Stand) -> Result<()> {
 
 // ---------------------------------------------------------------- formatting
 
-fn parse_curve(points: &[String]) -> Result<FanCurve> {
-    let pts = points
-        .iter()
-        .map(|p| {
-            let (t, d) = p
-                .split_once(':')
-                .context("points look like 40:20 (°C:duty%)")?;
-            Ok(CurvePoint::new(t.trim().parse()?, d.trim().parse()?))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    FanCurve::new(&pts).map_err(|e| anyhow::anyhow!("invalid curve: {e}"))
-}
-
-fn fmt_curve(c: &FanCurve) -> String {
-    c.points()
-        .iter()
-        .map(|p| format!("{}°C→{}%", p.temp_c, p.duty_pct))
-        .collect::<Vec<_>>()
-        .join("  ")
-}
-
-fn fmt_config(c: &Config) -> String {
-    format!(
-        "safe speed {}%, min duty {}%, failsafe after {} s",
-        c.safe_speed_pct, c.min_duty_pct, c.failsafe_timeout_s
-    )
-}
-
-fn fmt_status(s: Status) -> String {
-    if s.0 == 0 { "ok".into() } else { s.to_string() }
-}
-
 fn fmt_temp(d: &DebugInfo) -> String {
     match (d.temp_dc, d.temp_age_s) {
-        (Some(t), Some(a)) => format!("{:.1} °C ({a} s ago)", t as f32 / 10.0),
+        (Some(t), Some(a)) => format!("{} ({a} s ago)", DeciCelsius(t)),
         _ => "none received".into(),
     }
 }

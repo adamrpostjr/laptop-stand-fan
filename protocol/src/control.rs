@@ -119,38 +119,33 @@ impl Controller {
         core::mem::take(&mut self.dirty)
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        if self.settings.mode != mode {
-            self.settings.mode = mode;
+    /// The one way settings change: apply `f` to a copy, validate it, and
+    /// mark dirty only if something actually changed.
+    pub fn update_settings(&mut self, f: impl FnOnce(&mut Settings)) -> Result<(), DecodeError> {
+        let mut next = self.settings;
+        f(&mut next);
+        let next = next.validate()?;
+        if next != self.settings {
+            self.settings = next;
             self.dirty = true;
         }
+        Ok(())
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        let _ = self.update_settings(|s| s.mode = mode); // can't fail
     }
 
     pub fn set_manual_pct(&mut self, pct: u8) -> Result<(), DecodeError> {
-        if pct > 100 {
-            return Err(DecodeError::OutOfRange);
-        }
-        if self.settings.manual_pct != pct {
-            self.settings.manual_pct = pct;
-            self.dirty = true;
-        }
-        Ok(())
+        self.update_settings(|s| s.manual_pct = pct)
     }
 
     pub fn set_curve(&mut self, curve: FanCurve) {
-        if self.settings.curve != curve {
-            self.settings.curve = curve;
-            self.dirty = true;
-        }
+        let _ = self.update_settings(|s| s.curve = curve); // curves are valid by construction
     }
 
     pub fn set_config(&mut self, config: Config) -> Result<(), DecodeError> {
-        let config = config.validate()?;
-        if self.settings.config != config {
-            self.settings.config = config;
-            self.dirty = true;
-        }
-        Ok(())
+        self.update_settings(|s| s.config = config)
     }
 
     // ------------------------------------------------------------ inputs
@@ -189,15 +184,10 @@ impl Controller {
         self.cal_result
     }
 
-    /// Calibration samples (if one is running), for serial logging.
     /// RPM table of the current or most recent calibration (zeros if none).
     /// `[i]` is the reading at `calibration::duty_at_step(i)`.
     pub fn cal_samples(&self) -> &[[u16; FAN_COUNT]; STEPS] {
         &self.cal_samples
-    }
-
-    pub fn calibration(&self) -> Option<&Calibration> {
-        self.calibration.as_ref()
     }
 
     pub fn ms_since_temperature(&self, now_ms: u64) -> Option<u64> {
@@ -248,10 +238,8 @@ impl Controller {
                 self.calibration = None;
                 self.cal_result = match res {
                     Ok(d) => {
-                        if self.settings.config.min_duty_pct != d {
-                            self.settings.config.min_duty_pct = d;
-                            self.dirty = true;
-                        }
+                        // d is within MIN_DUTY_RANGE (checked by `analyse`)
+                        let _ = self.update_settings(|s| s.config.min_duty_pct = d);
                         CalResult::Ok { min_duty_pct: d }
                     }
                     Err(e) => CalResult::Failed(e),

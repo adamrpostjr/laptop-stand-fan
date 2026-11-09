@@ -42,6 +42,13 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Everything a `Settings` must satisfy (the curve is valid by construction).
+    pub fn validate(self) -> Result<Self, DecodeError> {
+        crate::codec::decode_percent(&[self.manual_pct])?;
+        self.config.validate()?;
+        Ok(self)
+    }
+
     pub fn to_blob(&self) -> [u8; BLOB_LEN] {
         let mut b = [0u8; BLOB_LEN];
         b[0..2].copy_from_slice(&MAGIC);
@@ -84,10 +91,28 @@ impl Settings {
     }
 }
 
+impl core::fmt::Display for Settings {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.mode {
+            Mode::Auto => f.write_str("mode auto")?,
+            Mode::Manual => write!(f, "mode manual {}%", self.manual_pct)?,
+        }
+        write!(f, " | curve {} | {}", self.curve, self.config)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::curve::CurvePoint;
+
+    #[test]
+    fn display() {
+        assert_eq!(
+            std::format!("{}", Settings::default()),
+            "mode auto | curve 40:20 50:30 65:50 75:75 85:100 | safe speed 60%, min duty 20%, failsafe after 30 s"
+        );
+    }
 
     #[test]
     fn roundtrip_default() {

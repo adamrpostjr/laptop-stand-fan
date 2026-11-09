@@ -26,8 +26,8 @@ pub struct Tach<'d> {
     smoother: RpmSmoother,
     last_sample_ms: u64,
     raw_rpm: u16,
-    probe_high: u8,
-    probe_total: u8,
+    /// High samples so far in the current window.
+    probe_acc: u8,
     /// High samples in the last window (see [`Tach::probe_level`]).
     last_probe_high: u8,
 }
@@ -76,8 +76,7 @@ impl<'d> Tach<'d> {
             smoother: RpmSmoother::new(1),
             last_sample_ms: now_ms,
             raw_rpm: 0,
-            probe_high: 0,
-            probe_total: 0,
+            probe_acc: 0,
             last_probe_high: 0,
         })
     }
@@ -98,9 +97,8 @@ impl<'d> Tach<'d> {
             }
         };
         self.raw_rpm = pulses_to_rpm(pulses, window, PULSES_PER_REV);
-        self.last_probe_high = self.probe_high;
-        self.probe_high = 0;
-        self.probe_total = 0;
+        self.last_probe_high = self.probe_acc;
+        self.probe_acc = 0;
         self.smoother.update(self.raw_rpm)
     }
 
@@ -108,8 +106,7 @@ impl<'d> Tach<'d> {
     /// toggling tach line apart from one stuck high (disconnected) or stuck low.
     pub fn probe_level(&mut self) {
         let high = unsafe { sys::gpio_get_level(self.gpio) } != 0;
-        self.probe_high = self.probe_high.saturating_add(high as u8);
-        self.probe_total = self.probe_total.saturating_add(1);
+        self.probe_acc = self.probe_acc.saturating_add(high as u8);
     }
 
     pub fn probe_high(&self) -> u8 {

@@ -72,6 +72,15 @@ pub const fn parse_key_hex(s: &str) -> Option<Key> {
     Some(out)
 }
 
+/// Lower-case hex form of a key (inverse of [`parse_key_hex`]).
+pub struct KeyHex<'a>(pub &'a Key);
+
+impl core::fmt::Display for KeyHex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +128,7 @@ mod tests {
         assert_eq!(parse_key_hex(&"0".repeat(63)), None);
         assert_eq!(parse_key_hex(&"0".repeat(65)), None);
         assert_eq!(parse_key_hex(&"g".repeat(64)), None);
+        let k: Key = seq();
+        assert_eq!(parse_key_hex(&std::format!("{}", KeyHex(&k))), Some(k));
     }
 }

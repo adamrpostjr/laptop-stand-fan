@@ -23,6 +23,14 @@ mod estimate;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use fanstand_protocol::codec::{TEMP_MAX_DC, TEMP_MIN_DC};
+
+/// °C → the wire's deci-°C, clamped to what the stand accepts.
+pub fn to_deci_celsius(c: f32) -> i16 {
+    (c * 10.0)
+        .round()
+        .clamp(TEMP_MIN_DC as f32, TEMP_MAX_DC as f32) as i16
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Reading {
@@ -32,7 +40,18 @@ pub struct Reading {
 
 impl Reading {
     pub fn deci_celsius(&self) -> i16 {
-        (self.celsius * 10.0).round().clamp(-400.0, 1500.0) as i16
+        to_deci_celsius(self.celsius)
+    }
+}
+
+impl std::fmt::Display for Reading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:.1} °C{}",
+            self.celsius,
+            if self.estimated { " (ESTIMATED)" } else { "" }
+        )
     }
 }
 

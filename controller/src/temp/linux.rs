@@ -3,7 +3,7 @@
 //! Sensors are found by driver **name**, never by `hwmonN` number (the
 //! numbers change between boots). Preference order:
 //! 1. `k10temp` / `zenpower` (AMD): `Tctl`, else `Tdie`, else the first input
-//! 2. `coretemp` (Intel): `Package id 0`, else the hottest core
+//! 2. `coretemp` (Intel): `Package id 0`, else the first input
 //! 3. thermal zones of type `x86_pkg_temp`, `cpu-thermal`, `cpu_thermal`, `soc_thermal`
 //!
 //! Generic `acpitz` zones are skipped: they're often a motherboard sensor, not
@@ -48,7 +48,7 @@ fn read_trim(p: &Path) -> Result<String> {
         .to_string())
 }
 
-fn sorted_dirs(dir: &str) -> Vec<PathBuf> {
+fn sorted_dirs(dir: impl AsRef<Path>) -> Vec<PathBuf> {
     let mut v: Vec<_> = fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -61,7 +61,7 @@ fn sorted_dirs(dir: &str) -> Vec<PathBuf> {
 
 /// `(label, input path)` for every `tempN_input` of a hwmon device.
 fn temp_inputs(hwmon: &Path) -> Vec<(String, PathBuf)> {
-    let mut out: Vec<_> = sorted_dirs(&hwmon.to_string_lossy())
+    let out: Vec<_> = sorted_dirs(hwmon)
         .into_iter()
         .filter_map(|p| {
             let name = p.file_name()?.to_str()?.to_string();
@@ -73,8 +73,7 @@ fn temp_inputs(hwmon: &Path) -> Vec<(String, PathBuf)> {
             Some((label, p))
         })
         .collect();
-    out.sort_by(|a, b| a.1.cmp(&b.1));
-    out
+    out // already in path order (sorted_dirs)
 }
 
 pub fn detect() -> Option<SysfsTemp> {

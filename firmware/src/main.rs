@@ -93,21 +93,18 @@ fn main() -> anyhow::Result<()> {
     let settings = storage
         .as_ref()
         .map_or_else(Settings::default, |s| s.load());
-    info!("settings: {}", control::describe(&settings));
+    info!("settings: {settings}");
 
     // 3. Tach, LED
     let now_ms = boot.elapsed().as_millis() as u64;
+    // A failed tach init reads 0 RPM, so stall protection runs the fans at 100 %.
+    let tach_or_log = |n: u8, t: anyhow::Result<tach::Tach<'static>>| {
+        t.inspect_err(|e| error!("fan {n} tach init failed: {e} (reads 0 RPM → stall protection)"))
+            .ok()
+    };
     let tach = [
-        tach::Tach::new(p.pins.gpio16, now_ms)
-            .inspect_err(|e| {
-                error!("fan 1 tach init failed: {e} (will read 0 RPM → stall protection)")
-            })
-            .ok(),
-        tach::Tach::new(p.pins.gpio19, now_ms)
-            .inspect_err(|e| {
-                error!("fan 2 tach init failed: {e} (will read 0 RPM → stall protection)")
-            })
-            .ok(),
+        tach_or_log(1, tach::Tach::new(p.pins.gpio16, now_ms)),
+        tach_or_log(2, tach::Tach::new(p.pins.gpio19, now_ms)),
     ];
     let mut led = PinDriver::output(p.pins.gpio2)?;
     led.set_high()?;

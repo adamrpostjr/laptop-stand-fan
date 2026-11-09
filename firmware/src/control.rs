@@ -11,13 +11,16 @@ use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::gpio::{Output, PinDriver};
 use esp_idf_svc::hal::task::watchdog::WatchdogSubscription;
-use fanstand_protocol::calibration::{STEPS, duty_at_step};
+use fanstand_protocol::calibration::{CalTable, STEP_MS, STEP_PCT, TOTAL_MS};
+use fanstand_protocol::codec::{ConfigPatch, ConfigRanges};
 use fanstand_protocol::diag::DebugInfo;
-use fanstand_protocol::{CalResult, Config, Controller, FanCurve, Mode, Settings};
+use fanstand_protocol::{
+    CalResult, Command, Config, Controller, DeciCelsius, FanCurve, Mode, Permille, Settings,
+};
 use log::{error, info, warn};
 
 use crate::fan::Fan;
-use crate::state::{Shared, Snapshot};
+use crate::state::Shared;
 use crate::storage::Storage;
 use crate::tach::Tach;
 
@@ -34,12 +37,11 @@ pub enum Request {
     SetManual(u8),
     Temperature(i16),
     SetCurve(FanCurve),
+    /// Whole config (BLE `CONFIG` write).
     SetConfig(Config),
-    SetSafeSpeed(u8),
-    SetMinDuty(u8),
-    SetFailsafeTimeout(u16),
-    StartCalibration,
-    AbortCalibration,
+    /// Some fields (console `safe 70`).
+    PatchConfig(ConfigPatch),
+    Command(Command),
     ResetDefaults,
     PrintStatus,
     PrintHelp,
@@ -111,14 +113,18 @@ pub fn run(
                 CalResult::Running { .. }
                     if !matches!(last_cal_result, CalResult::Running { .. }) =>
                 {
-                    info!("calibration started (~110 s): fans 100% then stepping down 5% every 5 s")
+                    info!(
+                        "calibration started (~{} s): fans 100%, then {STEP_PCT}% lower every {} s",
+                        TOTAL_MS / 1000,
+                        STEP_MS / 1000
+                    )
                 }
                 CalResult::Ok { min_duty_pct } => {
-                    print_cal_table(ctl.cal_samples());
+                    print!("{}", CalTable(ctl.cal_samples()));
                     info!("calibration OK: min duty = {min_duty_pct}% (saved)");
                 }
                 CalResult::Failed(code) => {
-                    print_cal_table(ctl.cal_samples());
+                    print!("{}", CalTable(ctl.cal_samples()));
                     warn!("calibration failed: {}", code.describe());
                 }
                 _ => {}
@@ -142,58 +148,52 @@ pub fn run(
         }
 
         // ---- publish for BLE (never blocks: skip this tick if BLE holds the lock)
+        let raw = [0, 1].map(|i| hw.tach[i].as_ref().map_or(0, |t| t.raw_rpm()));
+        let temp_age_ms = ctl.ms_since_temperature(now);
+
+        // ---- publish for BLE (never blocks: skip this tick if BLE holds the lock).
+        // Fields set once at boot (reset reason, no-auth flag) are left alone.
         if let Ok(mut snap) = shared.try_lock() {
-            let raw = |i: usize| hw.tach[i].as_ref().map_or(0, |t| t.raw_rpm());
-            let no_auth = snap.debug.flags & DebugInfo::FLAG_NO_AUTH;
-            *snap = Snapshot {
-                settings: *ctl.settings(),
-                rpm,
-                status: out.status,
-                cal: ctl.cal_result(),
-                cal_table: *ctl.cal_samples(),
-                debug: DebugInfo {
-                    uptime_s: (now / 1000) as u32,
-                    reset_reason: snap.debug.reset_reason,
-                    duty_permille: out.duty_permille,
-                    target_permille: out.target_permille,
-                    temp_dc: out.temp_dc,
-                    temp_age_s: ctl
-                        .ms_since_temperature(now)
-                        .map(|ms| (ms / 1000).min(u16::MAX as u64 - 1) as u16),
-                    raw_rpm: [raw(0), raw(1)],
-                    flags: no_auth
-                        | if out.in_grace {
-                            DebugInfo::FLAG_GRACE
-                        } else {
-                            0
-                        },
-                    free_heap: unsafe { esp_idf_svc::sys::esp_get_free_heap_size() },
-                    tach_high_samples: [0, 1]
-                        .map(|i| hw.tach[i].as_ref().map_or(0, |t| t.probe_high())),
-                },
-            };
+            snap.settings = *ctl.settings();
+            snap.rpm = rpm;
+            snap.status = out.status;
+            snap.cal = cal;
+            snap.cal_table = *ctl.cal_samples();
+            let d = &mut snap.debug;
+            d.uptime_s = (now / 1000) as u32;
+            d.duty_permille = out.duty_permille;
+            d.target_permille = out.target_permille;
+            d.temp_dc = out.temp_dc;
+            d.temp_age_s = temp_age_ms.map(|ms| (ms / 1000).min(u16::MAX as u64 - 1) as u16);
+            d.raw_rpm = raw;
+            d.flags = (d.flags & DebugInfo::FLAG_NO_AUTH)
+                | if out.in_grace {
+                    DebugInfo::FLAG_GRACE
+                } else {
+                    0
+                };
+            d.free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            d.tach_high_samples = [0, 1].map(|i| hw.tach[i].as_ref().map_or(0, |t| t.probe_high()));
         }
 
         // ---- periodic log
         if log_enabled && now >= next_log {
             next_log = now + LOG_PERIOD_MS;
-            let raw = |i: usize| hw.tach[i].as_ref().map_or(0, |t| t.raw_rpm());
-            let temp = match (out.temp_dc, ctl.ms_since_temperature(now)) {
-                (Some(t), Some(age)) => format!("{:.1}C ({}s ago)", t as f32 / 10.0, age / 1000),
-                _ => "none".into(),
-            };
             let mode = match ctl.settings().mode {
-                Mode::Manual => format!("Manual {}%", ctl.settings().manual_pct),
-                Mode::Auto => "Auto".into(),
+                Mode::Manual => "manual",
+                Mode::Auto => "auto",
             };
             info!(
-                "duty {:5.1}% (target {:5.1}%) | rpm {:4} / {:4} (raw {:4} / {:4}) | {mode} | temp {temp} | flags {}{}",
-                out.duty_permille as f32 / 10.0,
-                out.target_permille as f32 / 10.0,
+                "duty {} (target {}) | rpm {:4} / {:4} (raw {:4} / {:4}) | {mode} | temp {}{} | flags {}{}",
+                Permille(out.duty_permille),
+                Permille(out.target_permille),
                 rpm[0],
                 rpm[1],
-                raw(0),
-                raw(1),
+                raw[0],
+                raw[1],
+                out.temp_dc
+                    .map_or("none".into(), |t| DeciCelsius(t).to_string()),
+                temp_age_ms.map_or(String::new(), |ms| format!(" ({}s ago)", ms / 1000)),
                 out.status,
                 if out.in_grace { " (grace)" } else { "" },
             );
@@ -205,7 +205,6 @@ pub fn run(
 }
 
 fn handle(ctl: &mut Controller, req: Request, now: u64, log_enabled: &mut bool) {
-    let cfg = ctl.settings().config;
     let res: Result<(), String> = match req {
         Request::SetMode(m) => {
             ctl.set_mode(m);
@@ -217,44 +216,29 @@ fn handle(ctl: &mut Controller, req: Request, now: u64, log_enabled: &mut bool) 
             ctl.set_curve(c);
             Ok(())
         }
-        Request::SetConfig(c) => ctl.set_config(c).map_err(|e| e.to_string()),
-        Request::SetSafeSpeed(v) => ctl
-            .set_config(Config {
-                safe_speed_pct: v,
-                ..cfg
-            })
-            .map_err(|_| "safe speed must be 30-100".into()),
-        Request::SetMinDuty(v) => ctl
-            .set_config(Config {
-                min_duty_pct: v,
-                ..cfg
-            })
-            .map_err(|_| "min duty must be 0-60".into()),
-        Request::SetFailsafeTimeout(v) => ctl
-            .set_config(Config {
-                failsafe_timeout_s: v,
-                ..cfg
-            })
-            .map_err(|_| "timeout must be 5-600 s".into()),
-        Request::StartCalibration => ctl.start_calibration(now).map_err(|e| e.describe().into()),
-        Request::AbortCalibration => {
+        Request::SetConfig(c) => ctl.set_config(c).map_err(|_| ConfigRanges.to_string()),
+        Request::PatchConfig(p) => {
+            let cfg = ctl.settings().config;
+            cfg.apply(p)
+                .and_then(|c| ctl.set_config(c))
+                .map_err(|_| ConfigRanges.to_string())
+        }
+        Request::Command(Command::StartCalibration) => {
+            ctl.start_calibration(now).map_err(|e| e.describe().into())
+        }
+        Request::Command(Command::AbortCalibration) => {
             ctl.abort_calibration();
             Ok(())
         }
-        Request::ResetDefaults => {
-            let d = Settings::default();
-            ctl.set_mode(d.mode);
-            let _ = ctl.set_manual_pct(d.manual_pct);
-            ctl.set_curve(d.curve);
-            let _ = ctl.set_config(d.config);
-            Ok(())
-        }
+        Request::ResetDefaults => ctl
+            .update_settings(|s| *s = Settings::default())
+            .map_err(|e| e.to_string()),
         Request::PrintStatus => {
             print_status(ctl, now);
             Ok(())
         }
         Request::PrintHelp => {
-            println!("{}", crate::console::HELP);
+            crate::console::print_help();
             Ok(())
         }
         Request::ToggleLog => {
@@ -269,44 +253,12 @@ fn handle(ctl: &mut Controller, req: Request, now: u64, log_enabled: &mut bool) 
 }
 
 fn print_status(ctl: &Controller, now: u64) {
-    let cal_samples = ctl.cal_samples();
-    let s = ctl.settings();
     println!("firmware   {}", crate::FIRMWARE_VERSION);
-    println!("mode       {:?}, manual {}%", s.mode, s.manual_pct);
-    let pts: Vec<String> = s
-        .curve
-        .points()
-        .iter()
-        .map(|p| format!("{}:{}", p.temp_c, p.duty_pct))
-        .collect();
-    println!("curve      {}", pts.join(" "));
-    println!(
-        "config     safe {}%, min duty {}%, failsafe timeout {} s",
-        s.config.safe_speed_pct, s.config.min_duty_pct, s.config.failsafe_timeout_s
-    );
+    println!("settings   {}", ctl.settings());
     println!("status     {}", ctl.status_at(now));
     println!("cal        {:?}", ctl.cal_result());
-    if cal_samples.iter().any(|s| s[0] != 0 || s[1] != 0) {
-        print_cal_table(cal_samples);
+    let table = ctl.cal_samples();
+    if table.iter().any(|s| s[0] != 0 || s[1] != 0) {
+        print!("{}", CalTable(table));
     }
-}
-
-fn print_cal_table(samples: &[[u16; 2]; STEPS]) {
-    println!(" duty | fan1 rpm | fan2 rpm");
-    for (i, s) in samples.iter().enumerate() {
-        println!("{:4}% | {:8} | {:8}", duty_at_step(i), s[0], s[1]);
-    }
-}
-
-/// Used by the boot log.
-pub fn describe(settings: &Settings) -> String {
-    format!(
-        "mode {:?}, manual {}%, safe {}%, min {}%, timeout {} s, {} curve points",
-        settings.mode,
-        settings.manual_pct,
-        settings.config.safe_speed_pct,
-        settings.config.min_duty_pct,
-        settings.config.failsafe_timeout_s,
-        settings.curve.points().len()
-    )
 }

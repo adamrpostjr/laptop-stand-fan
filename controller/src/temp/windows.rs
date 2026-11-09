@@ -33,6 +33,8 @@ pub struct ThermalZones {
     path: &'static str,
     /// Divisor to get Kelvin (10 for "High Precision").
     scale: f64,
+    /// Reused between reads; u64 storage keeps the item array aligned.
+    buf: Vec<u64>,
 }
 
 // The PDH handles are only used from the one task that owns this.
@@ -59,6 +61,7 @@ pub fn detect() -> Option<ThermalZones> {
                 counter,
                 path,
                 scale,
+                buf: Vec::new(),
             };
             if z.read().is_ok() {
                 return Some(z);
@@ -83,9 +86,11 @@ impl ThermalZones {
         if r != PDH_MORE_DATA || size == 0 {
             bail!("no thermal zones (PDH 0x{r:08x})");
         }
-        // u64 storage keeps the item array correctly aligned.
-        let mut buf = vec![0u64; (size as usize).div_ceil(8)];
-        let items = buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+        let words = (size as usize).div_ceil(8);
+        if self.buf.len() < words {
+            self.buf.resize(words, 0);
+        }
+        let items = self.buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
         let r = unsafe {
             PdhGetFormattedCounterArrayW(
                 self.counter,

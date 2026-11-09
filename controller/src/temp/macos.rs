@@ -15,7 +15,8 @@ const PREFERRED: &[&[&str]] = &[&["tdie"], &["pacc", "eacc", "cpu"]];
 
 pub struct MacSensors {
     components: Components,
-    pattern: &'static [&'static str],
+    /// Indices of the CPU sensors we use (only these are refreshed).
+    cpu: Vec<usize>,
 }
 
 fn matches(label: &str, pattern: &[&str]) -> bool {
@@ -26,14 +27,16 @@ fn matches(label: &str, pattern: &[&str]) -> bool {
 pub fn detect() -> Option<MacSensors> {
     let components = Components::new_with_refreshed_list().ok()?;
     for pattern in PREFERRED {
-        let ok = components
+        let cpu: Vec<usize> = components
             .iter()
-            .any(|c| matches(c.label(), pattern) && c.temperature().is_some_and(|t| t > 0.0));
-        if ok {
-            return Some(MacSensors {
-                components,
-                pattern,
-            });
+            .enumerate()
+            .filter(|(_, c)| {
+                matches(c.label(), pattern) && c.temperature().is_some_and(|t| t > 0.0)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !cpu.is_empty() {
+            return Some(MacSensors { components, cpu });
         }
     }
     None
@@ -42,23 +45,24 @@ pub fn detect() -> Option<MacSensors> {
 impl Source for MacSensors {
     fn describe(&self) -> String {
         let labels: Vec<_> = self
-            .components
+            .cpu
             .iter()
-            .filter(|c| matches(c.label(), self.pattern))
-            .map(|c| c.label().to_string())
+            .filter_map(|&i| self.components.get(i))
+            .map(|c| c.label())
             .collect();
         format!("macOS sensors, hottest of: {}", labels.join(", "))
     }
 
     fn read(&mut self) -> Result<Reading> {
-        self.components.refresh(false);
-        let t = self
-            .components
-            .iter()
-            .filter(|c| matches(c.label(), self.pattern))
-            .filter_map(|c| c.temperature())
-            .filter(|t| (1.0..=150.0).contains(t))
-            .fold(f32::NAN, f32::max);
+        let mut t = f32::NAN;
+        for (i, c) in self.components.iter_mut().enumerate() {
+            if self.cpu.contains(&i) {
+                c.refresh();
+                if let Some(v) = c.temperature().filter(|v| (1.0..=150.0).contains(v)) {
+                    t = t.max(v);
+                }
+            }
+        }
         if t.is_nan() {
             bail!("no plausible CPU sensor reading");
         }

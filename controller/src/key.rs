@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use fanstand_protocol::auth::{KEY_LEN, Key, parse_key_hex};
+use fanstand_protocol::auth::{KEY_LEN, Key, KeyHex, parse_key_hex};
 
 pub fn key_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
@@ -43,7 +43,7 @@ pub fn generate(force: bool) -> Result<(PathBuf, String)> {
     }
     let mut k = [0u8; KEY_LEN];
     getrandom::fill(&mut k).map_err(|e| anyhow::anyhow!("OS RNG failed: {e}"))?;
-    let hex: String = k.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = KeyHex(&k).to_string();
     std::fs::create_dir_all(path.parent().unwrap())?;
     write_private(&path, &hex)?;
     Ok((path, hex))

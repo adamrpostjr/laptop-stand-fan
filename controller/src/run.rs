@@ -9,9 +9,11 @@
 //! (2 → 4 → 8 → 16 → 30 s), forever. While we're away the stand runs its own
 //! failsafe (safe speed after its timeout), so missing updates is safe.
 
+use std::convert::Infallible;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use fanstand_protocol::Permille;
 use fanstand_protocol::auth::Key;
 use log::{info, warn};
 
@@ -55,17 +57,17 @@ pub async fn run(key: Key, opt: Options) -> Result<()> {
     tokio::pin!(ctrl_c);
     let mut backoff = Duration::from_secs(2);
     loop {
-        let r = tokio::select! {
+        let end = tokio::select! {
             _ = &mut ctrl_c => break,
-            r = session(&key, &opt, src.as_mut()) => r,
+            end = session(&key, &opt, src.as_mut()) => end,
         };
-        let wait = match r {
-            // connected for a while then dropped: retry soon
-            Ok(()) => {
+        let wait = match end {
+            SessionEnd::LinkLost(e) => {
+                info!("link lost ({e:#}); reconnecting");
                 backoff = Duration::from_secs(2);
                 Duration::from_millis(500)
             }
-            Err(e) => {
+            SessionEnd::ConnectFailed(e) => {
                 warn!("{e:#}; retrying in {}s", backoff.as_secs());
                 let w = backoff;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -87,15 +89,25 @@ async fn timed<T>(what: &str, f: impl Future<Output = Result<T>>) -> Result<T> {
         .map_err(|_| anyhow!("{what}: timed out"))?
 }
 
-/// One connection. Returns `Ok(())` if the link dropped after working
-/// (reconnect immediately), `Err` if we couldn't get going (back off).
-async fn session(key: &Key, opt: &Options, src: &mut dyn Source) -> Result<()> {
-    let s = tokio::time::timeout(
+/// How a session ended, which decides the retry policy in [`run`].
+enum SessionEnd {
+    /// Worked, then dropped (sleep, range, stand reboot): reconnect right away.
+    LinkLost(anyhow::Error),
+    /// Never got going (not found, auth, Bluetooth off): back off.
+    ConnectFailed(anyhow::Error),
+}
+
+/// One connection, from scan to link loss. Never returns while healthy.
+async fn session(key: &Key, opt: &Options, src: &mut dyn Source) -> SessionEnd {
+    let connect = tokio::time::timeout(
         opt.scan_timeout + Duration::from_secs(40),
         Stand::connect(opt.device.as_deref(), Some(key), opt.scan_timeout),
-    )
-    .await
-    .map_err(|_| anyhow!("connect: timed out"))??;
+    );
+    let s = match connect.await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return SessionEnd::ConnectFailed(e),
+        Err(_) => return SessionEnd::ConnectFailed(anyhow!("connect: timed out")),
+    };
     let fw = timed("read version", s.firmware_version())
         .await
         .unwrap_or_default();
@@ -107,7 +119,7 @@ async fn session(key: &Key, opt: &Options, src: &mut dyn Source) -> Result<()> {
     let mut tick = tokio::time::interval(opt.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut n: u32 = 0;
-    let result: Result<()> = async {
+    let result: Result<Infallible> = async {
         loop {
             tick.tick().await;
             if !timed("link check", s.is_connected()).await? {
@@ -127,15 +139,12 @@ async fn session(key: &Key, opt: &Options, src: &mut dyn Source) -> Result<()> {
                 let rpm = timed("read rpm", s.rpm()).await?;
                 let st = timed("read status", s.status()).await?;
                 let d = timed("read debug", s.debug()).await?;
-                let cpu = reading.map_or("?".into(), |r| {
-                    format!("{:.1} °C{}", r.celsius, if r.estimated { " (ESTIMATED)" } else { "" })
-                });
+                let cpu = reading.map_or("?".into(), |r| r.to_string());
                 info!(
-                    "cpu {cpu} | stand: duty {:.0}% rpm {}/{} | {}",
-                    d.duty_permille as f32 / 10.0,
+                    "cpu {cpu} | stand: duty {} rpm {}/{} | {st}",
+                    Permille(d.duty_permille),
                     rpm[0],
-                    rpm[1],
-                    if st.0 == 0 { "ok".to_string() } else { st.to_string() }
+                    rpm[1]
                 );
                 if st.any_stalled() {
                     warn!("stand reports a STALLED fan ({st}); it is running both fans at 100%");
@@ -146,12 +155,10 @@ async fn session(key: &Key, opt: &Options, src: &mut dyn Source) -> Result<()> {
     }
     .await;
     s.disconnect().await;
-    match result {
-        // a link that worked and then dropped → reconnect without backoff
-        Err(e) if n > 0 => {
-            info!("link lost ({e:#}); reconnecting");
-            Ok(())
-        }
-        other => other,
+    let Err(e) = result;
+    if n > 0 {
+        SessionEnd::LinkLost(e)
+    } else {
+        SessionEnd::ConnectFailed(e)
     }
 }

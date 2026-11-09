@@ -11,6 +11,7 @@
 //! - **Disconnect:** state is kept and advertising restarts.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,19 +19,24 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use esp_idf_svc::sys;
 use esp32_nimble::utilities::BleUuid;
-use esp32_nimble::{BLEAdvertisementData, BLEDevice, NimbleProperties, OnWriteArgs};
+use esp32_nimble::utilities::mutex::Mutex as NimbleMutex;
+use esp32_nimble::{
+    BLEAdvertisementData, BLECharacteristic, BLEDevice, BLEService, NimbleProperties, OnWriteArgs,
+};
 use fanstand_protocol::auth::{Key, Nonce, verify_response};
-use fanstand_protocol::codec::{decode_percent, decode_temperature, encode_rpm};
+use fanstand_protocol::codec::{decode_percent, decode_temperature, encode_percent, encode_rpm};
 use fanstand_protocol::diag::{att_error, encode_cal_table};
 use fanstand_protocol::{CalResult, Command, Config, DecodeError, FanCurve, Mode, Status, uuids};
 use log::{info, warn};
 
 use crate::control::Request;
-use crate::state::{self, Shared};
+use crate::state::{self, Shared, Snapshot, lock};
 
 const PREFERRED_MTU: u16 = 185;
 const NOTIFY_POLL: Duration = Duration::from_millis(250);
 const RPM_NOTIFY_MS: u64 = 1000;
+
+type Chr = Arc<NimbleMutex<BLECharacteristic>>;
 
 #[derive(Clone, Copy)]
 struct ConnAuth {
@@ -38,9 +44,18 @@ struct ConnAuth {
     authed: bool,
 }
 
+impl ConnAuth {
+    fn fresh() -> Self {
+        Self {
+            nonce: new_nonce(),
+            authed: false,
+        }
+    }
+}
+
 type AuthMap = Arc<Mutex<HashMap<u16, ConnAuth>>>;
 
-fn uuid(u: u128) -> BleUuid {
+fn ble_uuid(u: u128) -> BleUuid {
     BleUuid::from_uuid128(uuids::to_le_bytes(u))
 }
 
@@ -62,23 +77,16 @@ struct Writer {
 
 impl Writer {
     fn is_authed(&self, conn: u16) -> bool {
-        self.key.is_none()
-            || self
-                .auth
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&conn)
-                .is_some_and(|c| c.authed)
+        self.key.is_none() || lock(&self.auth).get(&conn).is_some_and(|c| c.authed)
     }
 
     fn guarded(
         &self,
         args: &mut OnWriteArgs,
         name: &str,
-        decode: impl FnOnce(&[u8]) -> Result<Request, DecodeError>,
+        decode: fn(&[u8]) -> Result<Request, DecodeError>,
     ) {
-        let conn = args.desc().conn_handle();
-        if !self.is_authed(conn) {
+        if !self.is_authed(args.desc().conn_handle()) {
             warn!("BLE: unauthenticated write to {name} rejected");
             args.reject_with_error_code(att_error::NOT_AUTHENTICATED);
             return;
@@ -95,6 +103,33 @@ impl Writer {
     }
 }
 
+/// A characteristic whose value is taken from the latest snapshot on every read.
+fn readable(
+    svc: &mut BLEService,
+    uuid: u128,
+    props: NimbleProperties,
+    shared: &Shared,
+    value: fn(&Snapshot) -> Vec<u8>,
+) -> Chr {
+    let chr = svc.create_characteristic(ble_uuid(uuid), props);
+    let s = shared.clone();
+    chr.lock().on_read(move |c, _| {
+        c.set_value(&value(&state::read(&s)));
+    });
+    chr
+}
+
+/// Add the guarded write path to a characteristic.
+fn writable(
+    chr: &Chr,
+    w: &Writer,
+    name: &'static str,
+    decode: fn(&[u8]) -> Result<Request, DecodeError>,
+) {
+    let w = w.clone();
+    chr.lock().on_write(move |a| w.guarded(a, name, decode));
+}
+
 pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &str) -> Result<()> {
     let device = BLEDevice::take();
     BLEDevice::set_device_name(uuids::DEVICE_NAME).map_err(|e| anyhow!("{e:?}"))?;
@@ -104,6 +139,7 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
     let advertising = device.get_advertising();
     let server = device.get_server();
     let auth: AuthMap = Arc::default();
+    let connected = Arc::new(AtomicUsize::new(0));
     let w = Writer {
         auth: auth.clone(),
         tx,
@@ -112,20 +148,15 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
 
     // ---- connection lifecycle
     {
-        let auth = auth.clone();
+        let (auth, connected) = (auth.clone(), connected.clone());
         server.on_connect(move |server, desc| {
             info!(
                 "BLE: connected {:?} (handle {})",
                 desc.address(),
                 desc.conn_handle()
             );
-            auth.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                desc.conn_handle(),
-                ConnAuth {
-                    nonce: new_nonce(),
-                    authed: false,
-                },
-            );
+            lock(&auth).insert(desc.conn_handle(), ConnAuth::fresh());
+            connected.fetch_add(1, Ordering::Relaxed);
             // Keep advertising so a second device (or a laptop whose old link
             // hasn't timed out yet) can still connect.
             if server.connected_count() < sys::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as usize {
@@ -134,201 +165,123 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
         });
     }
     {
-        let auth = auth.clone();
+        let (auth, connected) = (auth.clone(), connected.clone());
         server.on_disconnect(move |desc, reason| {
             info!("BLE: disconnected {:?} ({reason:?})", desc.address());
-            auth.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&desc.conn_handle());
+            lock(&auth).remove(&desc.conn_handle());
+            let _ =
+                connected.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         });
     }
     server.advertise_on_disconnect(true);
 
-    let service = server.create_service(uuid(uuids::SERVICE));
+    let service = server.create_service(ble_uuid(uuids::SERVICE));
     let mut svc = service.lock();
+    let r = NimbleProperties::READ;
     let rw = NimbleProperties::READ | NimbleProperties::WRITE;
+    let notify = NimbleProperties::READ | NimbleProperties::NOTIFY;
 
-    // ---- MODE
-    {
-        let (s, w) = (shared.clone(), w.clone());
-        svc.create_characteristic(uuid(uuids::MODE), rw)
-            .lock()
-            .on_read(move |c, _| {
-                c.set_value(&state::read(&s).settings.mode.encode());
-            })
-            .on_write(move |a| w.guarded(a, "mode", |b| Mode::decode(b).map(Request::SetMode)));
-    }
-    // ---- MANUAL_SPEED
-    {
-        let (s, w) = (shared.clone(), w.clone());
-        svc.create_characteristic(uuid(uuids::MANUAL_SPEED), rw)
-            .lock()
-            .on_read(move |c, _| {
-                c.set_value(&[state::read(&s).settings.manual_pct]);
-            })
-            .on_write(move |a| {
-                w.guarded(a, "manual speed", |b| {
-                    decode_percent(b).map(Request::SetManual)
-                })
-            });
-    }
-    // ---- TEMPERATURE (write / write-without-response)
-    {
-        let w = w.clone();
-        svc.create_characteristic(
-            uuid(uuids::TEMPERATURE),
-            NimbleProperties::WRITE | NimbleProperties::WRITE_NO_RSP,
-        )
-        .lock()
-        .on_write(move |a| {
-            w.guarded(a, "temperature", |b| {
-                decode_temperature(b).map(Request::Temperature)
-            })
-        });
-    }
-    // ---- FAN_CURVE
-    {
-        let (s, w) = (shared.clone(), w.clone());
-        svc.create_characteristic(uuid(uuids::FAN_CURVE), rw)
-            .lock()
-            .on_read(move |c, _| {
-                let (buf, n) = state::read(&s).settings.curve.encode();
-                c.set_value(&buf[..n]);
-            })
-            .on_write(move |a| {
-                w.guarded(a, "curve", |b| FanCurve::decode(b).map(Request::SetCurve))
-            });
-    }
-    // ---- CONFIG
-    {
-        let (s, w) = (shared.clone(), w.clone());
-        svc.create_characteristic(uuid(uuids::CONFIG), rw)
-            .lock()
-            .on_read(move |c, _| {
-                c.set_value(&state::read(&s).settings.config.encode());
-            })
-            .on_write(move |a| {
-                w.guarded(a, "config", |b| Config::decode(b).map(Request::SetConfig))
-            });
-    }
-    // ---- COMMAND
-    {
-        let w = w.clone();
-        svc.create_characteristic(uuid(uuids::COMMAND), NimbleProperties::WRITE)
-            .lock()
-            .on_write(move |a| {
-                w.guarded(a, "command", |b| {
-                    Command::decode(b).map(|c| match c {
-                        Command::StartCalibration => Request::StartCalibration,
-                        Command::AbortCalibration => Request::AbortCalibration,
-                    })
-                })
-            });
-    }
-    // ---- FAN_RPM, STATUS, CAL_RESULT (read + notify)
-    let rpm_chr = svc.create_characteristic(
-        uuid(uuids::FAN_RPM),
-        NimbleProperties::READ | NimbleProperties::NOTIFY,
+    // ---- settings (read: snapshot, write: guarded)
+    let c = readable(&mut svc, uuids::MODE, rw, &shared, |s| {
+        s.settings.mode.encode().into()
+    });
+    writable(&c, &w, "mode", |b| Mode::decode(b).map(Request::SetMode));
+
+    let c = readable(&mut svc, uuids::MANUAL_SPEED, rw, &shared, |s| {
+        encode_percent(s.settings.manual_pct).into()
+    });
+    writable(&c, &w, "manual speed", |b| {
+        decode_percent(b).map(Request::SetManual)
+    });
+
+    let c = readable(&mut svc, uuids::FAN_CURVE, rw, &shared, |s| {
+        let (buf, n) = s.settings.curve.encode();
+        buf[..n].to_vec()
+    });
+    writable(&c, &w, "curve", |b| {
+        FanCurve::decode(b).map(Request::SetCurve)
+    });
+
+    let c = readable(&mut svc, uuids::CONFIG, rw, &shared, |s| {
+        s.settings.config.encode().into()
+    });
+    writable(&c, &w, "config", |b| {
+        Config::decode(b).map(Request::SetConfig)
+    });
+
+    // ---- write-only
+    let c = svc.create_characteristic(
+        ble_uuid(uuids::TEMPERATURE),
+        NimbleProperties::WRITE | NimbleProperties::WRITE_NO_RSP,
     );
-    {
-        let s = shared.clone();
-        rpm_chr
-            .lock()
-            .set_value(&encode_rpm([0, 0]))
-            .on_read(move |c, _| {
-                c.set_value(&encode_rpm(state::read(&s).rpm));
-            });
-    }
-    let status_chr = svc.create_characteristic(
-        uuid(uuids::STATUS),
-        NimbleProperties::READ | NimbleProperties::NOTIFY,
-    );
-    {
-        let s = shared.clone();
-        status_chr.lock().set_value(&[0]).on_read(move |c, _| {
-            c.set_value(&[state::read(&s).status.0]);
-        });
-    }
-    let cal_chr = svc.create_characteristic(
-        uuid(uuids::CAL_RESULT),
-        NimbleProperties::READ | NimbleProperties::NOTIFY,
-    );
-    {
-        let s = shared.clone();
-        cal_chr
-            .lock()
-            .set_value(&CalResult::None.encode())
-            .on_read(move |c, _| {
-                c.set_value(&state::read(&s).cal.encode());
-            });
-    }
-    // ---- FIRMWARE_VERSION
-    svc.create_characteristic(uuid(uuids::FIRMWARE_VERSION), NimbleProperties::READ)
+    writable(&c, &w, "temperature", |b| {
+        decode_temperature(b).map(Request::Temperature)
+    });
+
+    let c = svc.create_characteristic(ble_uuid(uuids::COMMAND), NimbleProperties::WRITE);
+    writable(&c, &w, "command", |b| {
+        Command::decode(b).map(Request::Command)
+    });
+
+    // ---- read + notify (the notifier thread pushes these)
+    let rpm_chr = readable(&mut svc, uuids::FAN_RPM, notify, &shared, |s| {
+        encode_rpm(s.rpm).into()
+    });
+    let status_chr = readable(&mut svc, uuids::STATUS, notify, &shared, |s| {
+        s.status.encode().into()
+    });
+    let cal_chr = readable(&mut svc, uuids::CAL_RESULT, notify, &shared, |s| {
+        s.cal.encode().into()
+    });
+
+    // ---- read-only
+    svc.create_characteristic(ble_uuid(uuids::FIRMWARE_VERSION), r)
         .lock()
         .set_value(version.as_bytes());
+    readable(&mut svc, uuids::DEBUG, r, &shared, |s| {
+        s.debug.encode().into()
+    });
+    readable(&mut svc, uuids::CAL_TABLE, r, &shared, |s| {
+        encode_cal_table(&s.cal_table).into()
+    });
+
     // ---- AUTH_CHALLENGE / AUTH_RESPONSE
     {
         let auth = auth.clone();
-        svc.create_characteristic(uuid(uuids::AUTH_CHALLENGE), NimbleProperties::READ)
+        svc.create_characteristic(ble_uuid(uuids::AUTH_CHALLENGE), r)
             .lock()
             .on_read(move |c, desc| {
-                let mut map = auth.lock().unwrap_or_else(|e| e.into_inner());
-                let entry = map.entry(desc.conn_handle()).or_insert(ConnAuth {
-                    nonce: new_nonce(),
-                    authed: false,
-                });
-                c.set_value(&entry.nonce);
+                let mut map = lock(&auth);
+                c.set_value(
+                    &map.entry(desc.conn_handle())
+                        .or_insert_with(ConnAuth::fresh)
+                        .nonce,
+                );
             });
     }
     {
-        let (auth_r, auth_w) = (auth.clone(), auth.clone());
-        let no_auth = key.is_none();
-        svc.create_characteristic(uuid(uuids::AUTH_RESPONSE), rw)
+        let (w_read, auth) = (w.clone(), auth.clone());
+        svc.create_characteristic(ble_uuid(uuids::AUTH_RESPONSE), rw)
             .lock()
             .on_read(move |c, desc| {
-                let ok = no_auth
-                    || auth_r
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&desc.conn_handle())
-                        .is_some_and(|a| a.authed);
-                c.set_value(&[ok as u8]);
+                c.set_value(&[w_read.is_authed(desc.conn_handle()) as u8]);
             })
             .on_write(move |a| {
                 let Some(key) = key else { return }; // no-auth build: accept anything
-                let conn = a.desc().conn_handle();
-                let mut map = auth_w.lock().unwrap_or_else(|e| e.into_inner());
-                let entry = map.entry(conn).or_insert(ConnAuth {
-                    nonce: new_nonce(),
-                    authed: false,
-                });
+                let mut map = lock(&auth);
+                let entry = map
+                    .entry(a.desc().conn_handle())
+                    .or_insert_with(ConnAuth::fresh);
                 let ok = verify_response(&key, &entry.nonce, a.recv_data());
                 // Fresh nonce after every attempt: a response can't be replayed.
                 entry.nonce = new_nonce();
+                entry.authed |= ok;
                 if ok {
-                    entry.authed = true;
                     info!("BLE: {:?} authenticated", a.desc().address());
                 } else {
                     warn!("BLE: {:?} failed authentication", a.desc().address());
                     a.reject_with_error_code(att_error::AUTH_FAILED);
                 }
-            });
-    }
-    // ---- DEBUG, CAL_TABLE
-    {
-        let s = shared.clone();
-        svc.create_characteristic(uuid(uuids::DEBUG), NimbleProperties::READ)
-            .lock()
-            .on_read(move |c, _| {
-                c.set_value(&state::read(&s).debug.encode());
-            });
-    }
-    {
-        let s = shared.clone();
-        svc.create_characteristic(uuid(uuids::CAL_TABLE), NimbleProperties::READ)
-            .lock()
-            .on_read(move |c, _| {
-                c.set_value(&encode_cal_table(&state::read(&s).cal_table));
             });
     }
     drop(svc);
@@ -339,7 +292,7 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
         .set_data(
             BLEAdvertisementData::new()
                 .name(uuids::DEVICE_NAME)
-                .add_service_uuid(uuid(uuids::SERVICE)),
+                .add_service_uuid(ble_uuid(uuids::SERVICE)),
         )
         .map_err(|e| anyhow!("advertising data: {e:?}"))?;
     advertising
@@ -356,7 +309,8 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
         }
     );
 
-    // ---- notifier thread: RPM every 1 s, STATUS / CAL_RESULT on change
+    // ---- notifier thread: RPM every 1 s, STATUS / CAL_RESULT on change.
+    // Idles while nobody is connected (no snapshot lock, no notify calls).
     std::thread::Builder::new()
         .name("ble-notify".into())
         .stack_size(4096)
@@ -366,6 +320,10 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
             let mut since_rpm = 0u64;
             loop {
                 std::thread::sleep(NOTIFY_POLL);
+                if connected.load(Ordering::Relaxed) == 0 {
+                    (last_status, last_cal) = (None, None);
+                    continue;
+                }
                 let snap = state::read(&shared);
                 since_rpm += NOTIFY_POLL.as_millis() as u64;
                 if since_rpm >= RPM_NOTIFY_MS {
@@ -374,7 +332,7 @@ pub fn start(shared: Shared, tx: Sender<Request>, key: Option<Key>, version: &st
                 }
                 if last_status != Some(snap.status) {
                     last_status = Some(snap.status);
-                    status_chr.lock().set_value(&[snap.status.0]).notify();
+                    status_chr.lock().set_value(&snap.status.encode()).notify();
                 }
                 if last_cal != Some(snap.cal) {
                     last_cal = Some(snap.cal);

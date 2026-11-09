@@ -3,7 +3,7 @@
 //! error codes.
 
 use crate::calibration::STEPS;
-use crate::codec::DecodeError;
+use crate::codec::{DecodeError, decode_rpm, encode_rpm};
 
 /// ATT application error codes (0x80–0x9F) returned by rejected writes.
 ///
@@ -17,6 +17,16 @@ pub mod att_error {
     pub const INVALID_VALUE: u8 = 0x81;
     /// Wrong HMAC in `AUTH_RESPONSE`.
     pub const AUTH_FAILED: u8 = 0x82;
+
+    /// Meaning of one of our codes, for client error messages.
+    pub const fn describe(code: u8) -> Option<&'static str> {
+        match code {
+            NOT_AUTHENTICATED => Some("not authenticated"),
+            INVALID_VALUE => Some("value rejected by the stand: out of range or invalid"),
+            AUTH_FAILED => Some("wrong key"),
+            _ => None,
+        }
+    }
 }
 
 /// Live diagnostics, 24 bytes LE (the firmware asks for a 185-byte MTU;
@@ -108,9 +118,8 @@ pub const CAL_TABLE_LEN: usize = STEPS * 4;
 
 pub fn encode_cal_table(t: &[[u16; 2]; STEPS]) -> [u8; CAL_TABLE_LEN] {
     let mut b = [0u8; CAL_TABLE_LEN];
-    for (i, s) in t.iter().enumerate() {
-        b[4 * i..4 * i + 2].copy_from_slice(&s[0].to_le_bytes());
-        b[4 * i + 2..4 * i + 4].copy_from_slice(&s[1].to_le_bytes());
+    for (chunk, row) in b.chunks_exact_mut(4).zip(t) {
+        chunk.copy_from_slice(&encode_rpm(*row));
     }
     b
 }
@@ -120,12 +129,8 @@ pub fn decode_cal_table(b: &[u8]) -> Result<[[u16; 2]; STEPS], DecodeError> {
         return Err(DecodeError::WrongLength);
     }
     let mut t = [[0u16; 2]; STEPS];
-    for (i, s) in t.iter_mut().enumerate() {
-        let c = &b[4 * i..4 * i + 4];
-        *s = [
-            u16::from_le_bytes([c[0], c[1]]),
-            u16::from_le_bytes([c[2], c[3]]),
-        ];
+    for (row, chunk) in t.iter_mut().zip(b.chunks_exact(4)) {
+        *row = decode_rpm(chunk)?;
     }
     Ok(t)
 }

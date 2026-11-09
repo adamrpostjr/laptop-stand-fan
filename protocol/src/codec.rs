@@ -11,6 +11,8 @@ pub enum DecodeError {
     UnknownValue,
     BadHeader,
     BadChecksum,
+    /// Text didn't parse (e.g. a curve point that isn't `TEMP:DUTY`).
+    Syntax,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -22,6 +24,7 @@ impl core::fmt::Display for DecodeError {
             Self::UnknownValue => "unknown value",
             Self::BadHeader => "bad header",
             Self::BadChecksum => "bad checksum",
+            Self::Syntax => "syntax error (curve points look like TEMP:DUTY, e.g. 40:20)",
         })
     }
 }
@@ -57,6 +60,10 @@ impl Mode {
 }
 
 // ---------------------------------------------------------------- Manual speed
+
+pub const fn encode_percent(pct: u8) -> [u8; 1] {
+    [pct]
+}
 
 pub fn decode_percent(b: &[u8]) -> Result<u8, DecodeError> {
     match b {
@@ -133,6 +140,15 @@ impl Status {
     pub const fn any_stalled(self) -> bool {
         self.0 & (Self::FAN1_STALLED | Self::FAN2_STALLED) != 0
     }
+    pub const fn encode(self) -> [u8; 1] {
+        [self.0]
+    }
+    pub fn decode(b: &[u8]) -> Result<Self, DecodeError> {
+        match b {
+            [v] => Ok(Self(*v)),
+            _ => Err(DecodeError::WrongLength),
+        }
+    }
 }
 
 impl core::fmt::Display for Status {
@@ -155,7 +171,7 @@ impl core::fmt::Display for Status {
             }
         }
         if first {
-            f.write_str("-")?;
+            f.write_str("ok")?;
         }
         Ok(())
     }
@@ -192,8 +208,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub const ENCODED_LEN: usize = 4;
-
     pub fn validate(self) -> Result<Self, DecodeError> {
         if SAFE_SPEED_RANGE.contains(&self.safe_speed_pct)
             && MIN_DUTY_RANGE.contains(&self.min_duty_pct)
@@ -224,6 +238,53 @@ impl Config {
 
     pub const fn failsafe_timeout_ms(&self) -> u64 {
         self.failsafe_timeout_s as u64 * 1000
+    }
+
+    /// Change only the fields set in `patch`, then validate.
+    pub fn apply(self, patch: ConfigPatch) -> Result<Self, DecodeError> {
+        Self {
+            safe_speed_pct: patch.safe_speed_pct.unwrap_or(self.safe_speed_pct),
+            min_duty_pct: patch.min_duty_pct.unwrap_or(self.min_duty_pct),
+            failsafe_timeout_s: patch.failsafe_timeout_s.unwrap_or(self.failsafe_timeout_s),
+        }
+        .validate()
+    }
+}
+
+impl core::fmt::Display for Config {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "safe speed {}%, min duty {}%, failsafe after {} s",
+            self.safe_speed_pct, self.min_duty_pct, self.failsafe_timeout_s
+        )
+    }
+}
+
+/// A partial [`Config`] edit (console `safe 70`, CLI `set-config --min 25`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigPatch {
+    pub safe_speed_pct: Option<u8>,
+    pub min_duty_pct: Option<u8>,
+    pub failsafe_timeout_s: Option<u16>,
+}
+
+/// Human-readable valid ranges, built from the range constants (for help
+/// and error messages, so they never go stale).
+pub struct ConfigRanges;
+
+impl core::fmt::Display for ConfigRanges {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "safe speed {}-{}%, min duty {}-{}%, failsafe timeout {}-{} s",
+            SAFE_SPEED_RANGE.start(),
+            SAFE_SPEED_RANGE.end(),
+            MIN_DUTY_RANGE.start(),
+            MIN_DUTY_RANGE.end(),
+            FAILSAFE_TIMEOUT_RANGE.start(),
+            FAILSAFE_TIMEOUT_RANGE.end()
+        )
     }
 }
 
@@ -383,7 +444,9 @@ mod tests {
         assert_eq!(std::format!("{s}"), "FAN2_STALLED|FAILSAFE");
         s.set(Status::FAN2_STALLED, false);
         assert!(!s.any_stalled());
-        assert_eq!(std::format!("{}", Status(0)), "-");
+        assert_eq!(std::format!("{}", Status(0)), "ok");
+        assert_eq!(Status::decode(&s.encode()), Ok(s));
+        assert_eq!(Status::decode(&[]), Err(DecodeError::WrongLength));
     }
 
     #[test]
@@ -416,6 +479,32 @@ mod tests {
             Ok(600)
         );
         assert_eq!(Config::decode(&[60, 20, 30]), Err(DecodeError::WrongLength));
+    }
+
+    #[test]
+    fn config_patch() {
+        let c = Config::default();
+        assert_eq!(c.apply(ConfigPatch::default()), Ok(c));
+        let p = ConfigPatch {
+            min_duty_pct: Some(25),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.apply(p),
+            Ok(Config {
+                min_duty_pct: 25,
+                ..c
+            })
+        );
+        let bad = ConfigPatch {
+            safe_speed_pct: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(c.apply(bad), Err(DecodeError::OutOfRange));
+        assert_eq!(
+            std::format!("{ConfigRanges}"),
+            "safe speed 30-100%, min duty 0-60%, failsafe timeout 5-600 s"
+        );
     }
 
     #[test]

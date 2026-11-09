@@ -102,7 +102,7 @@ impl Calibration {
         }
         let pct = self.step.map_or(100, duty_at_step);
         CalTick {
-            duty_permille: pct as u16 * 10,
+            duty_permille: crate::pct_to_permille(pct),
             finished: None,
         }
     }
@@ -148,6 +148,19 @@ pub fn analyse(samples: &[[u16; 2]; STEPS]) -> Result<u8, CalErrorCode> {
         return Err(CalErrorCode::MinDutyTooHigh);
     }
     Ok(min)
+}
+
+/// Prints a calibration table (duty | fan1 rpm | fan2 rpm), one row per step.
+pub struct CalTable<'a>(pub &'a [[u16; 2]; STEPS]);
+
+impl core::fmt::Display for CalTable<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, " duty | fan1 rpm | fan2 rpm")?;
+        for (i, s) in self.0.iter().enumerate() {
+            writeln!(f, "{:4}% | {:8} | {:8}", duty_at_step(i), s[0], s[1])?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

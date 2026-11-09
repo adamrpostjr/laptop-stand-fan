@@ -4,7 +4,7 @@
 //! control. If the lock is busy, that tick's update is skipped and the next
 //! one (100 ms later) publishes instead.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use fanstand_protocol::calibration::STEPS;
 use fanstand_protocol::diag::DebugInfo;
@@ -37,7 +37,12 @@ pub fn new_shared(settings: Settings, reset_reason: u8, no_auth: bool) -> Shared
     }))
 }
 
-/// Lock for the BLE side (NimBLE task / notifier thread). Recovers from poisoning.
+/// Lock that recovers from poisoning (a panicked holder can't wedge BLE).
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Copy of the latest snapshot, for the BLE side (NimBLE task / notifier thread).
 pub fn read(shared: &Shared) -> Snapshot {
-    *shared.lock().unwrap_or_else(|e| e.into_inner())
+    *lock(shared)
 }

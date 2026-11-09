@@ -34,9 +34,6 @@ pub use control::{ControlParams, Controller, Output};
 pub use curve::{CurvePoint, FanCurve};
 pub use settings::Settings;
 
-/// Bumped whenever the GATT encodings change incompatibly.
-pub const PROTOCOL_VERSION: u8 = 1;
-
 /// Number of fans on the stand.
 pub const FAN_COUNT: usize = 2;
 
@@ -52,9 +49,39 @@ pub const fn permille_to_pct(permille: u16) -> u8 {
     ((p + 5) / 10) as u8
 }
 
+/// Displays a permille duty as a percentage with one decimal, e.g. `62.5%`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permille(pub u16);
+
+impl core::fmt::Display for Permille {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{}%", self.0 / 10, self.0 % 10)
+    }
+}
+
+/// Displays deci-°C as `45.6 °C`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeciCelsius(pub i16);
+
+impl core::fmt::Display for DeciCelsius {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let sign = if self.0 < 0 { "-" } else { "" };
+        let a = self.0.unsigned_abs();
+        write!(f, "{sign}{}.{} °C", a / 10, a % 10)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_display() {
+        assert_eq!(std::format!("{}", Permille(625)), "62.5%");
+        assert_eq!(std::format!("{}", Permille(1000)), "100.0%");
+        assert_eq!(std::format!("{}", DeciCelsius(456)), "45.6 °C");
+        assert_eq!(std::format!("{}", DeciCelsius(-5)), "-0.5 °C");
+    }
 
     #[test]
     fn pct_permille_roundtrip() {
