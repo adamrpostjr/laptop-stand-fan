@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["protocol", "firmware", "controller"]
+# `cargo build` / `cargo test` at the workspace root only touch host crates.
+# The firmware is built from inside `firmware/`, which selects the `esp`
+# toolchain (firmware/rust-toolchain.toml) and the Xtensa target
+# (firmware/.cargo/config.toml).
+default-members = ["protocol", "controller"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+fanstand-protocol = { path = "protocol" }
+
+# Profiles must live in the workspace root. Size-optimised builds suit the
+# firmware and don't hurt the desktop app.
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # symbols don't end up in flash
+opt-level = "z" # unoptimised ESP-IDF builds overflow stacks / flash

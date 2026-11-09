@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.fanstand.controller</string>
+    <key>CFBundleName</key>
+    <string>fanstand</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>fanstand talks to your cooling laptop stand over Bluetooth LE to send the CPU temperature.</string>
+</dict>
+</plist>

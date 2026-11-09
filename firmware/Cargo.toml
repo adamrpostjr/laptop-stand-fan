@@ -1,0 +1,26 @@
+[package]
+name = "fanstand-firmware"
+description = "ESP32 firmware for the BLE cooling laptop stand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fanstand-firmware"
+harness = false # no std test harness on the device
+test = false
+bench = false
+
+[dependencies]
+fanstand-protocol.workspace = true
+esp-idf-svc = "0.53" # re-exports esp-idf-hal (`esp_idf_svc::hal`) and esp-idf-sys (`esp_idf_svc::sys`)
+esp32-nimble = "0.13"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"
+
+[features]
+# Test build for nRF Connect: disables the BLE shared-secret check.
+no-auth = []

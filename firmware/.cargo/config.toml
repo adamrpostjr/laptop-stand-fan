@@ -1,0 +1,18 @@
+[build]
+target = "xtensa-esp32-espidf"
+
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32"
+ESP_IDF_VERSION = "v5.5.5"
+# Share one ESP-IDF checkout + tools under ~/.espressif across projects.
+ESP_IDF_TOOLS_INSTALL_DIR = "global"
+# The cargo workspace root is one level up, so point esp-idf-sys at our file explicitly.
+ESP_IDF_SDKCONFIG_DEFAULTS = { value = "sdkconfig.defaults", relative = true }

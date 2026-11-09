@@ -1,0 +1,6 @@
+# Read by espflash when run from this directory (`cargo run` uses it as the runner).
+[idf]
+partition_table = "partitions.csv"
+
+[flash]
+size = "4MB" # WROOM-32D
